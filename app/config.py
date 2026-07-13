@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Type, TypeVar
 
 CONFIG_DIR = Path.home() / ".automail"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+T = TypeVar("T")
+
+
+def _from_mapping(cls: Type[T], data: Any) -> T:
+    if not isinstance(data, dict):
+        return cls()
+    allowed = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in allowed})
 
 
 @dataclass
@@ -19,6 +28,17 @@ class SmtpConfig:
     username: str = ""
     password: str = ""
     sender: str = ""
+
+
+@dataclass
+class ProxyConfig:
+    enabled: bool = False
+    # socks5 | http（本地 Clash / V2Ray 等常用）
+    proxy_type: str = "socks5"
+    host: str = "127.0.0.1"
+    port: int = 7890
+    username: str = ""
+    password: str = ""
 
 
 @dataclass
@@ -43,15 +63,17 @@ class ScheduleConfig:
 @dataclass
 class AppConfig:
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
+    proxy: ProxyConfig = field(default_factory=ProxyConfig)
     mail: MailConfig = field(default_factory=MailConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AppConfig:
         return cls(
-            smtp=SmtpConfig(**data.get("smtp", {})),
-            mail=MailConfig(**data.get("mail", {})),
-            schedule=ScheduleConfig(**data.get("schedule", {})),
+            smtp=_from_mapping(SmtpConfig, data.get("smtp", {})),
+            proxy=_from_mapping(ProxyConfig, data.get("proxy", {})),
+            mail=_from_mapping(MailConfig, data.get("mail", {})),
+            schedule=_from_mapping(ScheduleConfig, data.get("schedule", {})),
         )
 
     def to_dict(self) -> dict[str, Any]:

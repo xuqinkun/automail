@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 
-from app.config import AppConfig, MailConfig, ScheduleConfig, SmtpConfig
+from app.config import AppConfig, MailConfig, ProxyConfig, ScheduleConfig, SmtpConfig
 from app.email_sender import send_email
 
 
@@ -147,14 +147,22 @@ def calc_interval_minutes(
 class _SendWorker(QObject):
     finished = Signal(bool, str)
 
-    def __init__(self, smtp_cfg: SmtpConfig, mail_cfg: MailConfig) -> None:
+    def __init__(
+        self,
+        smtp_cfg: SmtpConfig,
+        mail_cfg: MailConfig,
+        proxy_cfg: Optional[ProxyConfig] = None,
+        generation: int = 0,
+    ) -> None:
         super().__init__()
         self._smtp_cfg = smtp_cfg
         self._mail_cfg = mail_cfg
+        self._proxy_cfg = proxy_cfg
+        self.generation = generation
 
     def run(self) -> None:
         try:
-            send_email(self._smtp_cfg, self._mail_cfg)
+            send_email(self._smtp_cfg, self._mail_cfg, self._proxy_cfg)
             self.finished.emit(True, "")
         except Exception as exc:
             self.finished.emit(False, str(exc))
@@ -175,7 +183,10 @@ class MailScheduler(QObject):
         self._next_send_at: Optional[datetime] = None
         self._sending = False
         self._send_started_at: Optional[datetime] = None
+        self._send_generation = 0
         self._thread: Optional[QThread] = None
+        self._worker: Optional[_SendWorker] = None
+        self._pending_result: Optional[tuple[bool, str]] = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -211,9 +222,42 @@ class MailScheduler(QObject):
         self._running = False
         self._timer.stop()
         self._next_send_at = None
+        self._shutdown_send_thread()
         self.running_changed.emit(False)
         self.status_changed.emit("已停止")
         self.log_message.emit("调度已停止")
+
+    def _shutdown_send_thread(self, timeout_ms: int = 3000) -> None:
+        """在主线程中停止发送线程，避免退出时 QThread 仍在运行。"""
+        self._send_generation += 1
+        self._pending_result = None
+        thread = self._thread
+        worker = self._worker
+        self._thread = None
+        self._worker = None
+        self._sending = False
+
+        if thread is None:
+            return
+
+        if thread.isRunning():
+            # SMTP 阻塞在 socket 时 quit 无效；短等后强制结束
+            try:
+                thread.finished.disconnect(self._on_thread_finished)
+            except (RuntimeError, TypeError):
+                pass
+            thread.quit()
+            if not thread.wait(timeout_ms):
+                thread.terminate()
+                thread.wait(1000)
+
+        if worker is not None:
+            try:
+                worker.finished.disconnect(self._on_worker_finished)
+            except (RuntimeError, TypeError):
+                pass
+            worker.deleteLater()
+        thread.deleteLater()
 
     def _schedule_next_send(self, now: datetime) -> None:
         assert self._config is not None
@@ -298,6 +342,18 @@ class MailScheduler(QObject):
             return
 
         if self._sending:
+            # 兜底：若 SMTP 异常导致长期无回调，避免界面永久停在「正在发送」
+            if (
+                self._send_started_at is not None
+                and (now - self._send_started_at).total_seconds() > 90
+            ):
+                self.log_message.emit(
+                    f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    "发送超时未返回结果，请检查 SMTP 设置后重试"
+                )
+                self._shutdown_send_thread(timeout_ms=1000)
+                if self._running:
+                    self._schedule_next_send(now)
             return
 
         self._do_send(now)
@@ -306,31 +362,68 @@ class MailScheduler(QObject):
         assert self._config is not None
         daily_count = self._config.schedule.daily_count
 
+        # 确保不会叠两个发送线程
+        if self._thread is not None and self._thread.isRunning():
+            return
+
         self._sending = True
         self._send_started_at = now
+        self._send_generation += 1
+        generation = self._send_generation
+        self._pending_result = None
         self.log_message.emit(
             f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
             f"正在发送第 {self._sent_today + 1}/{daily_count} 封..."
         )
 
-        worker = _SendWorker(self._config.smtp, self._config.mail)
-        thread = QThread(self)
+        worker = _SendWorker(
+            self._config.smtp,
+            self._config.mail,
+            self._config.proxy,
+            generation=generation,
+        )
+        # 不设置 parent，避免窗口销毁时 QThread 仍在运行被连带析构
+        thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(self._on_send_finished)
+        # 必须 QueuedConnection：lambda/无 context 时默认可能在工作线程直连执行
+        worker.finished.connect(
+            self._on_worker_finished, Qt.ConnectionType.QueuedConnection
+        )
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_thread_finished)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        self._worker = worker
         self._thread = thread
         thread.start()
 
-    def _on_send_finished(self, success: bool, error: str) -> None:
-        self._sending = False
-        self._thread = None
+    def _on_worker_finished(self, success: bool, error: str) -> None:
+        """在主线程接收发送结果；不在此 wait 线程。"""
+        worker = self._worker
+        if worker is None or worker.generation != self._send_generation:
+            return
+        self._pending_result = (success, error)
 
-        if self._config is None:
+    def _on_thread_finished(self) -> None:
+        """线程真正退出后再写日志 / 调度下一封。"""
+        if self.sender() is not self._thread:
             return
 
+        result = self._pending_result
+        generation_ok = (
+            self._worker is not None
+            and self._worker.generation == self._send_generation
+        )
+        self._pending_result = None
+        self._thread = None
+        self._worker = None
+        self._sending = False
+
+        if not generation_ok or result is None or self._config is None:
+            return
+
+        success, error = result
         now = self._send_started_at or datetime.now()
         daily_count = self._config.schedule.daily_count
 

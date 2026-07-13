@@ -124,6 +124,18 @@ AutoMail-macOS-arm64.zip
 AutoMail-macOS-x86_64.zip
 ```
 
+如果构建已经完成但脚本没有自动下载，可从任务 URL 末尾取得 Run ID 后手动下载：
+
+```powershell
+$runId = "29254517140"
+$target = ".\dist\github-actions\run-$runId"
+New-Item -ItemType Directory -Force -Path $target | Out-Null
+gh run download $runId --repo xuqinkun/automail `
+  --pattern "AutoMail-macOS-*" --dir $target
+```
+
+也可以打开任务页面，在页面底部的 `Artifacts` 区域分别点击两个构建包。
+
 GitHub Actions 内部会调用 `build_macos.sh` 创建 `dist/AutoMail.app`、检查二进制架构
 和签名，再使用 macOS 自带的 `ditto` 打包，以保留应用包所需的文件属性。
 

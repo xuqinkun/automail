@@ -103,9 +103,9 @@ try {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     $dispatchOutput | ForEach-Object { Write-Host $_ }
+    $dispatchText = $dispatchOutput -join "`n"
 
     if ($dispatchExitCode -ne 0) {
-        $dispatchText = $dispatchOutput -join "`n"
         if (
             $dispatchText -match "HTTP 403" -and
             $dispatchText -match "Resource not accessible by personal access token"
@@ -129,32 +129,45 @@ https://github.com/settings/personal-access-tokens
         throw "触发 GitHub Actions 失败。"
     }
 
-    $run = $null
-    for ($attempt = 1; $attempt -le 30 -and $null -eq $run; $attempt++) {
-        Start-Sleep -Seconds 2
-        $runJson = & gh run list `
-            --repo $Repository `
-            --workflow build-macos.yml `
-            --branch $Ref `
-            --event workflow_dispatch `
-            --commit $localHead `
-            --limit 10 `
-            --json databaseId,createdAt,status,url
-        Assert-CommandSucceeded "查询 GitHub Actions 运行状态失败。"
+    # 新版 gh 会直接返回运行 URL；优先从 URL 取 ID，避免 Actions 排队时轮询超时。
+    $runId = ""
+    $runUrl = ""
+    $runUrlMatch = [regex]::Match(
+        $dispatchText,
+        "https://github\.com/[^\s]+/actions/runs/(?<id>\d+)"
+    )
+    if ($runUrlMatch.Success) {
+        $runId = $runUrlMatch.Groups["id"].Value
+        $runUrl = $runUrlMatch.Value
+    } else {
+        $run = $null
+        for ($attempt = 1; $attempt -le 30 -and $null -eq $run; $attempt++) {
+            Start-Sleep -Seconds 2
+            $runJson = & gh run list `
+                --repo $Repository `
+                --workflow build-macos.yml `
+                --branch $Ref `
+                --event workflow_dispatch `
+                --commit $localHead `
+                --limit 10 `
+                --json databaseId,createdAt,status,url
+            Assert-CommandSucceeded "查询 GitHub Actions 运行状态失败。"
 
-        $runs = @($runJson | ConvertFrom-Json)
-        $run = $runs |
-            Where-Object { [DateTimeOffset]::Parse($_.createdAt) -ge $dispatchStarted } |
-            Sort-Object { [DateTimeOffset]::Parse($_.createdAt) } -Descending |
-            Select-Object -First 1
+            $runs = @($runJson | ConvertFrom-Json)
+            $run = $runs |
+                Where-Object { [DateTimeOffset]::Parse($_.createdAt) -ge $dispatchStarted } |
+                Sort-Object { [DateTimeOffset]::Parse($_.createdAt) } -Descending |
+                Select-Object -First 1
+        }
+
+        if ($null -eq $run) {
+            throw "已触发构建，但 60 秒内未找到对应任务。请到 GitHub Actions 页面查看。"
+        }
+        $runId = [string]$run.databaseId
+        $runUrl = [string]$run.url
     }
 
-    if ($null -eq $run) {
-        throw "已触发构建，但 60 秒内未找到对应任务。请到 GitHub Actions 页面查看。"
-    }
-
-    $runId = [string]$run.databaseId
-    Write-Host "构建任务：$($run.url)"
+    Write-Host "构建任务：$runUrl"
     & gh run watch $runId --repo $Repository --exit-status
     Assert-CommandSucceeded "macOS 构建失败，请打开上面的任务链接查看日志。"
 

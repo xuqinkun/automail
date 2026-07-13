@@ -63,11 +63,30 @@ python main.py
 
 > 国内邮箱通常需开启 SMTP 并使用**授权码**而非登录密码。
 
-## 打包为 macOS 应用（可选）
+## 打包为 macOS 应用
+
+> 必须在 macOS 上执行；PyInstaller 不支持从 Windows 交叉生成 macOS `.app`。
 
 ```bash
-pip install pyinstaller
-pyinstaller --windowed --name AutoMail main.py
+bash build_macos.sh
 ```
 
-生成的 `.app` 位于 `dist/AutoMail.app`。
+脚本会在 `.build/macos/` 中创建隔离构建环境，并生成：
+
+```text
+dist/AutoMail.app
+```
+
+默认使用 `python3`，产物架构跟随该 Python（Apple Silicon 为 `arm64`，Intel 为
+`x86_64`）。可选参数：
+
+```bash
+# 指定 Python、应用图标和 Developer ID 签名（均为可选）
+PYTHON_BIN=/opt/homebrew/bin/python3 \
+ICON_PATH=/path/to/AutoMail.icns \
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+bash build_macos.sh
+```
+
+未提供 `CODESIGN_IDENTITY` 时，PyInstaller 使用临时签名，适合本机运行。若要分发
+给其他用户，还需要 Apple Developer ID 正式签名并完成 notarization（公证）。

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import smtplib
 import ssl
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from app import email_sender
-from app.config import ProxyConfig
+from app.config import MailConfig, ProxyConfig, SmtpConfig
 
 
 class OpenSmtpWithRetryTests(unittest.TestCase):
@@ -79,6 +81,43 @@ class OpenSmtpWithRetryTests(unittest.TestCase):
 
         open_smtp.assert_called_once()
         sleep.assert_not_called()
+
+    def test_other_socket_connection_errors_keep_host_context(self) -> None:
+        smtp = SmtpConfig(
+            host="smtp.example.com",
+            port=587,
+            use_ssl=False,
+            sender="sender@example.com",
+        )
+        mail = MailConfig(recipients="recipient@example.com")
+
+        with (
+            mock.patch.object(
+                email_sender,
+                "_deliver",
+                side_effect=ConnectionRefusedError("connection refused"),
+            ),
+            mock.patch.object(email_sender, "_log_exception"),
+            self.assertRaises(ConnectionError) as raised,
+        ):
+            email_sender.send_email(smtp, mail)
+
+        self.assertIn("smtp.example.com:587", str(raised.exception))
+
+    def test_logging_works_without_stderr_in_windowed_app(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir) / "logs"
+            with (
+                mock.patch.object(email_sender, "LOG_DIR", log_dir),
+                mock.patch.object(email_sender.sys, "stderr", None),
+            ):
+                email_sender._log_info("packaged app log")
+
+            log_files = list(log_dir.glob("error-*.log"))
+            self.assertEqual(len(log_files), 1)
+            self.assertIn(
+                "packaged app log", log_files[0].read_text(encoding="utf-8")
+            )
 
 
 if __name__ == "__main__":

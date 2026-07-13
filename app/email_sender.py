@@ -21,7 +21,8 @@ SMTP_TIMEOUT_SECONDS = 30
 SMTP_CONNECT_RETRY_DELAYS = (1.0,)
 # 只重试“SMTP 欢迎语返回前断线”。此时尚未登录或提交邮件，不会造成重复发送。
 SMTP_CONNECT_ATTEMPTS = len(SMTP_CONNECT_RETRY_DELAYS) + 1
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+# 冻结为 .app 后应用包不可写；日志与配置统一放到用户目录。
+LOG_DIR = Path.home() / ".automail" / "logs"
 # 隐式 SSL(465) 经代理失败时，回退到 STARTTLS 常用端口
 STARTTLS_FALLBACK_PORT = 587
 
@@ -30,12 +31,23 @@ class _SMTPGreetingDisconnectedError(ConnectionError):
     """SMTP 连接建立后、服务器欢迎语返回前被关闭。"""
 
 
+def _write_stderr(text: str, *, end: str = "\n") -> None:
+    """窗口模式可能没有 stderr；此时静默跳过控制台输出。"""
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(text, file=stream, end=end)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def _log_exception(message: str, exc: BaseException) -> None:
     """把异常完整堆栈打到控制台，并追加写入 logs/。"""
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     text = f"[{stamp}] {message}\n{tb}"
-    print(text, file=sys.stderr, end="" if text.endswith("\n") else "\n")
+    _write_stderr(text, end="" if text.endswith("\n") else "\n")
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = LOG_DIR / f"error-{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -45,13 +57,13 @@ def _log_exception(message: str, exc: BaseException) -> None:
                 f.write("\n")
             f.write("\n")
     except OSError as log_exc:
-        print(f"写入日志文件失败：{log_exc}", file=sys.stderr)
+        _write_stderr(f"写入日志文件失败：{log_exc}")
 
 
 def _log_info(message: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = f"[{stamp}] {message}"
-    print(text, file=sys.stderr)
+    _write_stderr(text)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = LOG_DIR / f"error-{datetime.now().strftime('%Y-%m-%d')}.log"

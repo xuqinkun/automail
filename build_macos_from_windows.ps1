@@ -34,7 +34,7 @@ try {
         throw "找不到 .github/workflows/build-macos.yml。"
     }
 
-    & gh auth status --hostname github.com
+    & gh auth status --hostname github.com *> $null
     Assert-CommandSucceeded "GitHub CLI 尚未登录，请先执行：gh auth login"
 
     $changes = @(& git status --porcelain)
@@ -71,8 +71,38 @@ try {
 
     $dispatchStarted = (Get-Date).ToUniversalTime().AddSeconds(-5)
     Write-Host "触发 GitHub macOS 构建：$Repository@$Ref ($Architecture)"
-    & gh workflow run build-macos.yml --repo $Repository --ref $Ref -f "architecture=$Architecture"
-    Assert-CommandSucceeded "触发 GitHub Actions 失败。"
+    $dispatchOutput = @(
+        & gh workflow run build-macos.yml `
+            --repo $Repository `
+            --ref $Ref `
+            -f "architecture=$Architecture" 2>&1
+    )
+    $dispatchExitCode = $LASTEXITCODE
+    $dispatchOutput | ForEach-Object { Write-Host $_ }
+
+    if ($dispatchExitCode -ne 0) {
+        $dispatchText = $dispatchOutput -join "`n"
+        if (
+            $dispatchText -match "HTTP 403" -and
+            $dispatchText -match "Resource not accessible by personal access token"
+        ) {
+            throw @"
+当前 GitHub 凭据没有触发 Actions 的权限。
+
+如果使用 github_pat_ 开头的细粒度 PAT，请打开：
+https://github.com/settings/personal-access-tokens
+
+编辑当前 Token，并设置：
+  Repository access: 包含 $Repository
+  Repository permissions > Actions: Read and write
+
+保存后重新运行本脚本。也可以改用浏览器 OAuth 登录：
+  gh auth logout --hostname github.com
+  gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
+"@
+        }
+        throw "触发 GitHub Actions 失败。"
+    }
 
     $run = $null
     for ($attempt = 1; $attempt -le 30 -and $null -eq $run; $attempt++) {

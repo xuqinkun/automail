@@ -75,6 +75,16 @@ winget install --id GitHub.cli
 gh auth login
 ```
 
+如果登录使用的是 `github_pat_` 开头的细粒度 PAT，需要让该 Token 包含本仓库，
+并把 `Repository permissions > Actions` 设置为 `Read and write`。否则触发构建时
+会收到 `HTTP 403: Resource not accessible by personal access token`。也可改用 GitHub
+CLI 的浏览器 OAuth 登录：
+
+```powershell
+gh auth logout --hostname github.com
+gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
+```
+
 将当前修改提交并推送到 GitHub 后执行：
 
 ```powershell

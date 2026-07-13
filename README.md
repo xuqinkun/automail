@@ -85,10 +85,26 @@ gh auth logout --hostname github.com
 gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
 ```
 
+如果连接 GitHub 时出现 `TLS handshake timeout`，先让 GitHub CLI 走本地代理。例如
+CordC / Clash 的 mixed 端口为 `7890` 时：
+
+```powershell
+$env:HTTP_PROXY="http://127.0.0.1:7890"
+$env:HTTPS_PROXY="http://127.0.0.1:7890"
+gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
+```
+
 将当前修改提交并推送到 GitHub 后执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_macos_from_windows.ps1 -Architecture all
+```
+
+若后续触发和下载也需要代理，可直接传入：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_macos_from_windows.ps1 `
+  -Architecture all -ProxyUrl http://127.0.0.1:7890
 ```
 
 `all` 会同时生成 Apple Silicon (`arm64`) 和 Intel (`x86_64`) 两个版本。也可只构建

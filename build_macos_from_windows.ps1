@@ -7,11 +7,26 @@ param(
 
     [string]$Repository = "",
 
-    [string]$Ref = ""
+    [string]$Ref = "",
+
+    [string]$ProxyUrl = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
+    [Uri]$proxyUri = $null
+    if (-not [Uri]::TryCreate($ProxyUrl, [UriKind]::Absolute, [ref]$proxyUri)) {
+        throw "代理地址无效：$ProxyUrl"
+    }
+    if ($proxyUri.Scheme -notin @("http", "https", "socks5")) {
+        throw "不支持的代理协议：$($proxyUri.Scheme)（支持 http / https / socks5）"
+    }
+    $env:HTTP_PROXY = $ProxyUrl
+    $env:HTTPS_PROXY = $ProxyUrl
+    Write-Host "GitHub CLI 使用代理：$ProxyUrl"
+}
 
 function Assert-CommandSucceeded {
     param([string]$Message)

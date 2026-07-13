@@ -86,13 +86,22 @@ try {
 
     $dispatchStarted = (Get-Date).ToUniversalTime().AddSeconds(-5)
     Write-Host "触发 GitHub macOS 构建：$Repository@$Ref ($Architecture)"
-    $dispatchOutput = @(
-        & gh workflow run build-macos.yml `
-            --repo $Repository `
-            --ref $Ref `
-            -f "architecture=$Architecture" 2>&1
-    )
-    $dispatchExitCode = $LASTEXITCODE
+    # Windows PowerShell 5.1 会在 $ErrorActionPreference=Stop 时把原生程序 stderr
+    # 提升成终止异常，导致下面的 HTTP 403 诊断没有机会运行。
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $dispatchOutput = @(
+            & gh workflow run build-macos.yml `
+                --repo $Repository `
+                --ref $Ref `
+                -f "architecture=$Architecture" 2>&1
+        )
+        $dispatchExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $dispatchOutput | ForEach-Object { Write-Host $_ }
 
     if ($dispatchExitCode -ne 0) {
@@ -112,6 +121,7 @@ https://github.com/settings/personal-access-tokens
   Repository permissions > Actions: Read and write
 
 保存后重新运行本脚本。也可以改用浏览器 OAuth 登录：
+  Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
   gh auth logout --hostname github.com
   gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
 "@

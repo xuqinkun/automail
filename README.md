@@ -81,8 +81,10 @@ gh auth login
 CLI 的浏览器 OAuth 登录：
 
 ```powershell
+Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
 gh auth logout --hostname github.com
 gh auth login --hostname github.com --git-protocol https --web --scopes repo,workflow
+gh auth status
 ```
 
 如果连接 GitHub 时出现 `TLS handshake timeout`，先让 GitHub CLI 走本地代理。例如

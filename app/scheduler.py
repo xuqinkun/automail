@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Optional
+from typing import Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
-from app.config import AppConfig, ScheduleConfig
+from app.config import AppConfig, MailConfig, ScheduleConfig, SmtpConfig
 from app.email_sender import send_email
 
 
@@ -63,11 +63,24 @@ def build_daily_plan(
     else:
         first_send = combine_datetime(today, start_t)
         if first_send < now:
-            # 今天的开始时间已过，从当前时刻起算
             first_send = now
 
-    last_send = first_send + timedelta(minutes=schedule.interval_minutes * (schedule.daily_count - 1))
+    last_send = first_send + timedelta(
+        minutes=schedule.interval_minutes * (schedule.daily_count - 1)
+    )
     deadline_dt = combine_datetime(today, deadline)
+
+    if last_send.date() > today:
+        return SchedulePlan(
+            first_send,
+            last_send,
+            False,
+            (
+                f"计划最后一封发送时间为次日 {last_send.strftime('%H:%M')}，"
+                f"超过了当天最晚发送时刻 {deadline.strftime('%H:%M')}。"
+                f"请减少次数、缩短间隔或推迟开始时间。"
+            ),
+        )
 
     if last_send > deadline_dt:
         return SchedulePlan(
@@ -81,15 +94,70 @@ def build_daily_plan(
             ),
         )
 
+    first_label = (
+        first_send.strftime("%H:%M")
+        if start_t is not None
+        else f"立即发送（{first_send.strftime('%H:%M')}）"
+    )
     return SchedulePlan(
         first_send,
         last_send,
         True,
         (
-            f"今日计划：首封 {first_send.strftime('%H:%M')}，"
+            f"今日计划：首封 {first_label}，"
             f"末封 {last_send.strftime('%H:%M')}，共 {schedule.daily_count} 封"
         ),
     )
+
+
+def calc_interval_minutes(
+    schedule: ScheduleConfig,
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    """根据起止时刻和每天次数，自动计算发送间隔（分钟）。"""
+    if schedule.daily_count <= 1:
+        return 1
+
+    now = now or datetime.now()
+    today = now.date()
+
+    try:
+        deadline = parse_hhmm(schedule.deadline_time)
+        if deadline is None:
+            return None
+        start_t = parse_hhmm(schedule.start_time)
+    except ValueError:
+        return None
+
+    if start_t is None:
+        first_send = now
+    else:
+        first_send = combine_datetime(today, start_t)
+        if first_send < now:
+            first_send = now
+
+    deadline_dt = combine_datetime(today, deadline)
+    if deadline_dt <= first_send:
+        return None
+
+    total_minutes = int((deadline_dt - first_send).total_seconds() // 60)
+    return max(1, total_minutes // (schedule.daily_count - 1))
+
+
+class _SendWorker(QObject):
+    finished = Signal(bool, str)
+
+    def __init__(self, smtp_cfg: SmtpConfig, mail_cfg: MailConfig) -> None:
+        super().__init__()
+        self._smtp_cfg = smtp_cfg
+        self._mail_cfg = mail_cfg
+
+    def run(self) -> None:
+        try:
+            send_email(self._smtp_cfg, self._mail_cfg)
+            self.finished.emit(True, "")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
 
 
 class MailScheduler(QObject):
@@ -105,6 +173,9 @@ class MailScheduler(QObject):
         self._sent_today = 0
         self._current_day = date.today()
         self._next_send_at: Optional[datetime] = None
+        self._sending = False
+        self._send_started_at: Optional[datetime] = None
+        self._thread: Optional[QThread] = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -143,6 +214,27 @@ class MailScheduler(QObject):
         self.running_changed.emit(False)
         self.status_changed.emit("已停止")
         self.log_message.emit("调度已停止")
+
+    def _schedule_next_send(self, now: datetime) -> None:
+        assert self._config is not None
+        daily_count = self._config.schedule.daily_count
+
+        if self._sent_today < daily_count:
+            self._next_send_at = now + timedelta(
+                minutes=self._config.schedule.interval_minutes
+            )
+            remaining = daily_count - self._sent_today
+            projected_last = self._next_send_at + timedelta(
+                minutes=self._config.schedule.interval_minutes * (remaining - 1)
+            )
+            deadline = parse_hhmm(self._config.schedule.deadline_time)
+            if deadline:
+                deadline_dt = combine_datetime(now.date(), deadline)
+                if projected_last > deadline_dt:
+                    self.log_message.emit("后续发送将超过最晚时刻，今日任务提前结束")
+                    self._sent_today = daily_count
+        else:
+            self.status_changed.emit(f"今日已完成 {self._sent_today}/{daily_count} 封")
 
     def _reset_for_new_day(self, now: datetime) -> None:
         assert self._config is not None
@@ -205,14 +297,44 @@ class MailScheduler(QObject):
             self._sent_today = daily_count
             return
 
+        if self._sending:
+            return
+
         self._do_send(now)
 
     def _do_send(self, now: datetime) -> None:
         assert self._config is not None
         daily_count = self._config.schedule.daily_count
 
-        try:
-            send_email(self._config.smtp, self._config.mail)
+        self._sending = True
+        self._send_started_at = now
+        self.log_message.emit(
+            f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"正在发送第 {self._sent_today + 1}/{daily_count} 封..."
+        )
+
+        worker = _SendWorker(self._config.smtp, self._config.mail)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_send_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        thread.start()
+
+    def _on_send_finished(self, success: bool, error: str) -> None:
+        self._sending = False
+        self._thread = None
+
+        if self._config is None:
+            return
+
+        now = self._send_started_at or datetime.now()
+        daily_count = self._config.schedule.daily_count
+
+        if success:
             self._sent_today += 1
             msg = (
                 f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -220,25 +342,12 @@ class MailScheduler(QObject):
             )
             self.log_message.emit(msg)
             self.send_finished.emit(True, msg)
-        except Exception as exc:
-            msg = f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 发送失败：{exc}"
+        else:
+            msg = f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 发送失败：{error}"
             self.log_message.emit(msg)
             self.send_finished.emit(False, msg)
 
-        if self._sent_today < daily_count:
-            self._next_send_at = now + timedelta(minutes=self._config.schedule.interval_minutes)
-            # 再次校验末封时间
-            remaining = daily_count - self._sent_today
-            projected_last = self._next_send_at + timedelta(
-                minutes=self._config.schedule.interval_minutes * (remaining - 1)
-            )
-            deadline = parse_hhmm(self._config.schedule.deadline_time)
-            if deadline:
-                deadline_dt = combine_datetime(now.date(), deadline)
-                if projected_last > deadline_dt:
-                    self.log_message.emit(
-                        "后续发送将超过最晚时刻，今日任务提前结束"
-                    )
-                    self._sent_today = daily_count
-        else:
-            self.status_changed.emit(f"今日已完成 {self._sent_today}/{daily_count} 封")
+        if not self._running:
+            return
+
+        self._schedule_next_send(now)

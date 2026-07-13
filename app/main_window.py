@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,8 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppConfig, load_config, save_config
-from app.email_sender import send_email
-from app.scheduler import build_daily_plan
+from app.scheduler import MailScheduler, build_daily_plan, calc_interval_minutes
 
 
 class MainWindow(QMainWindow):
@@ -34,9 +32,12 @@ class MainWindow(QMainWindow):
         self.resize(1200, 720)
 
         self._config = load_config()
+        self._scheduler = MailScheduler(self)
 
         self._build_ui()
         self._load_to_form()
+        self._auto_calc_interval()
+        self._connect_signals()
         self._refresh_plan_preview()
 
     def _build_ui(self) -> None:
@@ -97,11 +98,9 @@ class MainWindow(QMainWindow):
         self.schedule_count = QSpinBox()
         self.schedule_count.setRange(1, 999)
         self.schedule_count.setValue(3)
-        self.schedule_count.valueChanged.connect(self._refresh_plan_preview)
-        count_unit = QLabel("次/天")
-        count_unit.setStyleSheet("color: #666;")
-        count_row.addWidget(self.schedule_count)
-        count_row.addWidget(count_unit)
+        self.schedule_count.valueChanged.connect(self._on_schedule_changed)
+        
+        count_row.addWidget(self.schedule_count)        
         count_row.addStretch()
         schedule_form.addRow("每天次数", count_row)
 
@@ -109,7 +108,7 @@ class MainWindow(QMainWindow):
         self.schedule_interval = QSpinBox()
         self.schedule_interval.setRange(1, 1440)
         self.schedule_interval.setValue(30)
-        self.schedule_interval.valueChanged.connect(self._refresh_plan_preview)
+        self.schedule_interval.setEnabled(False)
         interval_unit = QLabel("分钟")
         interval_unit.setStyleSheet("color: #666;")
         interval_row.addWidget(self.schedule_interval)
@@ -120,15 +119,15 @@ class MainWindow(QMainWindow):
         self.schedule_deadline = QLineEdit()
         self.schedule_deadline.setPlaceholderText("23:59")
         self.schedule_deadline.setText("23:59")
-        self.schedule_deadline.textChanged.connect(self._refresh_plan_preview)
+        self.schedule_deadline.editingFinished.connect(self._on_schedule_changed)
         schedule_form.addRow("最晚时刻", self.schedule_deadline)
 
         self.schedule_start = QLineEdit()
-        self.schedule_start.setPlaceholderText("留空立即发送")
-        self.schedule_start.textChanged.connect(self._refresh_plan_preview)
+        self.schedule_start.setPlaceholderText("留空按当前时间")
+        self.schedule_start.editingFinished.connect(self._on_schedule_changed)
         schedule_form.addRow("开始时刻", self.schedule_start)
 
-        schedule_hint = QLabel("末封不能超过最晚时刻。")
+        schedule_hint = QLabel("根据起止时间和发送次数自动计算间隔；开始留空按当前时间。")
         schedule_hint.setWordWrap(True)
         schedule_hint.setStyleSheet("color: #666; font-size: 12px;")
         schedule_form.addRow(schedule_hint)
@@ -141,9 +140,15 @@ class MainWindow(QMainWindow):
         )
         settings_col.addWidget(self.plan_label)
 
+        save_row = QHBoxLayout()
         self.save_btn = QPushButton("保存配置")
         self.save_btn.clicked.connect(self._on_save)
-        settings_col.addWidget(self.save_btn)
+        self.save_status_label = QLabel("")
+        self.save_status_label.setStyleSheet("color: #2e7d32; font-size: 12px;")
+        save_row.addWidget(self.save_btn)
+        save_row.addWidget(self.save_status_label)
+        save_row.addStretch()
+        settings_col.addLayout(save_row)
         settings_col.addStretch()
 
         settings_widget = QWidget()
@@ -180,19 +185,11 @@ class MainWindow(QMainWindow):
 
         send_row = QHBoxLayout()
         send_row.addStretch()
-        self.send_btn = QPushButton("发送邮件")
-        self.send_btn.setStyleSheet(
-            "QPushButton { background: #007aff; color: white; padding: 8px 20px; "
-            "border-radius: 6px; font-weight: bold; }"
-            "QPushButton:hover { background: #0066d6; }"
-            "QPushButton:disabled { background: #a0a0a0; }"
-        )
-        self.send_btn.clicked.connect(self._on_send)
+        self.send_btn = QPushButton("开始自动发送")
+        self.send_btn.setStyleSheet(self._start_btn_style())
+        self.send_btn.clicked.connect(self._on_toggle_schedule)
         send_row.addWidget(self.send_btn)
         mail_box_layout.addLayout(send_row)
-
-        body_label = QLabel("正文")
-        mail_box_layout.addWidget(body_label)
 
         self.mail_body = QTextEdit()
         self.mail_body.setPlaceholderText("邮件正文...")
@@ -215,6 +212,24 @@ class MainWindow(QMainWindow):
         main_row.addWidget(mail_widget, stretch=3)
         main_row.addWidget(log_box, stretch=1)
         root.addLayout(main_row, stretch=1)
+
+    def _start_btn_style(self) -> str:
+        return (
+            "QPushButton { background: #007aff; color: white; padding: 8px 20px; "
+            "border-radius: 6px; font-weight: bold; }"
+            "QPushButton:hover { background: #0066d6; }"
+        )
+
+    def _stop_btn_style(self) -> str:
+        return (
+            "QPushButton { background: #ff3b30; color: white; padding: 8px 20px; "
+            "border-radius: 6px; font-weight: bold; }"
+            "QPushButton:hover { background: #d70015; }"
+        )
+
+    def _connect_signals(self) -> None:
+        self._scheduler.log_message.connect(self._append_log)
+        self._scheduler.running_changed.connect(self._on_running_changed)
 
     def _load_to_form(self) -> None:
         c = self._config
@@ -257,6 +272,27 @@ class MainWindow(QMainWindow):
 
         return self._config
 
+    def _current_schedule(self):
+        from app.config import ScheduleConfig
+
+        return ScheduleConfig(
+            daily_count=self.schedule_count.value(),
+            interval_minutes=self.schedule_interval.value(),
+            deadline_time=self.schedule_deadline.text().strip(),
+            start_time=self.schedule_start.text().strip(),
+        )
+
+    def _auto_calc_interval(self) -> None:
+        interval = calc_interval_minutes(self._current_schedule())
+        if interval is not None:
+            self.schedule_interval.blockSignals(True)
+            self.schedule_interval.setValue(interval)
+            self.schedule_interval.blockSignals(False)
+
+    def _on_schedule_changed(self) -> None:
+        self._auto_calc_interval()
+        self._refresh_plan_preview()
+
     def _refresh_plan_preview(self) -> None:
         cfg = self._collect_config()
         plan = build_daily_plan(cfg.schedule)
@@ -274,12 +310,27 @@ class MainWindow(QMainWindow):
     def _on_save(self) -> None:
         cfg = self._collect_config()
         save_config(cfg)
-        QMessageBox.information(self, "保存成功", "配置已保存到 ~/.automail/config.json")
+        self.save_status_label.setText("✅ 配置已保存")
+        QTimer.singleShot(3000, self.save_status_label.clear)
 
     def _append_log(self, text: str) -> None:
         self.log_view.append(text)
 
-    def _on_send(self) -> None:
+    def _on_running_changed(self, running: bool) -> None:
+        if running:
+            self.send_btn.setText("停止自动发送")
+            self.send_btn.setStyleSheet(self._stop_btn_style())
+            self.save_btn.setEnabled(False)
+        else:
+            self.send_btn.setText("开始自动发送")
+            self.send_btn.setStyleSheet(self._start_btn_style())
+            self.save_btn.setEnabled(True)
+
+    def _on_toggle_schedule(self) -> None:
+        if self._scheduler.is_running:
+            self._scheduler.stop()
+            return
+
         cfg = self._collect_config()
         if not cfg.smtp.host:
             QMessageBox.warning(self, "提示", "请填写 SMTP 服务器")
@@ -288,21 +339,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请填写收件人")
             return
 
-        self.send_btn.setEnabled(False)
-        try:
-            send_email(cfg.smtp, cfg.mail)
-            save_config(cfg)
-            msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 邮件发送成功"
-            self._append_log(msg)
-            QMessageBox.information(self, "成功", "邮件已发送")
-        except Exception as exc:
-            msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 发送失败：{exc}"
-            self._append_log(msg)
-            QMessageBox.critical(self, "发送失败", str(exc))
-        finally:
-            self.send_btn.setEnabled(True)
+        save_config(cfg)
+
+        plan = build_daily_plan(cfg.schedule)
+        if not plan.valid:
+            QMessageBox.warning(self, "计划无效", plan.message)
+            return
+
+        ok, msg = self._scheduler.start(cfg)
+        if not ok:
+            QMessageBox.warning(self, "无法启动", msg)
 
     def closeEvent(self, event) -> None:
+        if self._scheduler.is_running:
+            reply = QMessageBox.question(
+                self,
+                "确认退出",
+                "自动发送正在运行，退出将停止调度。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._scheduler.stop()
         save_config(self._collect_config())
         event.accept()
 

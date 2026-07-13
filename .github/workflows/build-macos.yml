@@ -1,0 +1,65 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: macOS architecture to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - arm64
+          - x86_64
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    name: Build Apple Silicon (arm64)
+    if: inputs.architecture == 'all' || inputs.architecture == 'arm64'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Build app bundle
+        run: bash build_macos.sh
+      - name: Verify architecture
+        run: lipo -archs dist/AutoMail.app/Contents/MacOS/AutoMail | grep -qw arm64
+      - name: Create archive
+        run: ditto -c -k --sequesterRsrc --keepParent dist/AutoMail.app dist/AutoMail-macOS-arm64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AutoMail-macOS-arm64
+          path: dist/AutoMail-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-x86-64:
+    name: Build Intel (x86_64)
+    if: inputs.architecture == 'all' || inputs.architecture == 'x86_64'
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Build app bundle
+        run: bash build_macos.sh
+      - name: Verify architecture
+        run: lipo -archs dist/AutoMail.app/Contents/MacOS/AutoMail | grep -qw x86_64
+      - name: Create archive
+        run: ditto -c -k --sequesterRsrc --keepParent dist/AutoMail.app dist/AutoMail-macOS-x86_64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AutoMail-macOS-x86_64
+          path: dist/AutoMail-macOS-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
+

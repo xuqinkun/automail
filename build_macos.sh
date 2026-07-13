@@ -12,7 +12,7 @@ fail() {
   exit 1
 }
 
-[[ "$(uname -s)" == "Darwin" ]] || fail "此脚本必须在 macOS 上运行，不能在 Windows/Linux 上交叉打包。"
+[[ "$(uname -s)" == "Darwin" ]] || fail "此脚本必须在 macOS 上运行；Windows 请改用 build_macos_from_windows.ps1。"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "找不到 Python：$PYTHON_BIN"
 [[ -f "$ROOT_DIR/main.py" ]] || fail "找不到入口文件：$ROOT_DIR/main.py"
 [[ -f "$ROOT_DIR/requirements.txt" ]] || fail "找不到依赖文件：$ROOT_DIR/requirements.txt"

@@ -63,30 +63,48 @@ python main.py
 
 > 国内邮箱通常需开启 SMTP 并使用**授权码**而非登录密码。
 
-## 打包为 macOS 应用
+## 在 Windows 下生成 macOS 应用
 
-> 必须在 macOS 上执行；PyInstaller 不支持从 Windows 交叉生成 macOS `.app`。
+PyInstaller 不能直接在 Windows 上交叉生成 macOS `.app`。本项目通过 Windows
+PowerShell 脚本触发 GitHub Actions 的 macOS 构建机，并自动下载打包结果。
 
-```bash
-bash build_macos.sh
+首次使用先安装并登录 GitHub CLI：
+
+```powershell
+winget install --id GitHub.cli
+gh auth login
 ```
 
-脚本会在 `.build/macos/` 中创建隔离构建环境，并生成：
+将当前修改提交并推送到 GitHub 后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_macos_from_windows.ps1 -Architecture all
+```
+
+`all` 会同时生成 Apple Silicon (`arm64`) 和 Intel (`x86_64`) 两个版本。也可只构建
+一个架构：
+
+```powershell
+.\build_macos_from_windows.ps1 -Architecture arm64
+.\build_macos_from_windows.ps1 -Architecture x86_64
+```
+
+下载结果位于 `dist/github-actions/run-<任务编号>/`，其中包含：
 
 ```text
-dist/AutoMail.app
+AutoMail-macOS-arm64.zip
+AutoMail-macOS-x86_64.zip
 ```
 
-默认使用 `python3`，产物架构跟随该 Python（Apple Silicon 为 `arm64`，Intel 为
-`x86_64`）。可选参数：
+GitHub Actions 内部会调用 `build_macos.sh` 创建 `dist/AutoMail.app`、检查二进制架构
+和签名，再使用 macOS 自带的 `ditto` 打包，以保留应用包所需的文件属性。
+
+若本身就在 macOS 上，也可以直接执行：
 
 ```bash
-# 指定 Python、应用图标和 Developer ID 签名（均为可选）
-PYTHON_BIN=/opt/homebrew/bin/python3 \
-ICON_PATH=/path/to/AutoMail.icns \
-CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 bash build_macos.sh
 ```
 
-未提供 `CODESIGN_IDENTITY` 时，PyInstaller 使用临时签名，适合本机运行。若要分发
-给其他用户，还需要 Apple Developer ID 正式签名并完成 notarization（公证）。
+可通过 `PYTHON_BIN`、`ICON_PATH` 和 `CODESIGN_IDENTITY` 环境变量指定 Python、
+`.icns` 图标与 Developer ID。未提供正式签名时仅适合本机测试；对外分发还需要
+Apple Developer ID 签名与 notarization（公证）。

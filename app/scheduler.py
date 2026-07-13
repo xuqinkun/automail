@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from app.config import AppConfig, MailConfig, ProxyConfig, ScheduleConfig, SmtpConfig
 from app.email_sender import send_email
@@ -144,8 +145,17 @@ def calc_interval_minutes(
     return max(1, total_minutes // (schedule.daily_count - 1))
 
 
-class _SendWorker(QObject):
-    finished = Signal(bool, str)
+MAX_CONSECUTIVE_FAILURES = 3
+SEND_WATCHDOG_SECONDS = 90
+
+
+class _SendResultBridge(QObject):
+    """把普通 Python 线程的结果安全投递回 Qt 主线程。"""
+
+    finished = Signal(int, bool, str, bool)
+
+
+class _SendWorker:
 
     def __init__(
         self,
@@ -153,19 +163,37 @@ class _SendWorker(QObject):
         mail_cfg: MailConfig,
         proxy_cfg: Optional[ProxyConfig] = None,
         generation: int = 0,
+        publish: Optional[Callable[[int, bool, str, bool], None]] = None,
     ) -> None:
-        super().__init__()
         self._smtp_cfg = smtp_cfg
         self._mail_cfg = mail_cfg
         self._proxy_cfg = proxy_cfg
         self.generation = generation
+        self._publish = publish
+        self._cancelled = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
 
     def run(self) -> None:
+        success = False
+        error = ""
         try:
             send_email(self._smtp_cfg, self._mail_cfg, self._proxy_cfg)
-            self.finished.emit(True, "")
+            success = True
         except Exception as exc:
-            self.finished.emit(False, str(exc))
+            error = str(exc)
+
+        if self._publish is not None:
+            try:
+                self._publish(self.generation, success, error, self.cancelled)
+            except RuntimeError:
+                # 应用退出时 Qt bridge 可能已经销毁；后台守护线程直接结束即可。
+                pass
 
 
 class MailScheduler(QObject):
@@ -184,9 +212,14 @@ class MailScheduler(QObject):
         self._sending = False
         self._send_started_at: Optional[datetime] = None
         self._send_generation = 0
-        self._thread: Optional[QThread] = None
+        self._thread: Optional[threading.Thread] = None
         self._worker: Optional[_SendWorker] = None
-        self._pending_result: Optional[tuple[bool, str]] = None
+        self._consecutive_failures = 0
+
+        self._send_results = _SendResultBridge(self)
+        self._send_results.finished.connect(
+            self._on_worker_finished, Qt.ConnectionType.QueuedConnection
+        )
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -208,6 +241,7 @@ class MailScheduler(QObject):
         self._config = config
         self._running = True
         self._sent_today = 0
+        self._consecutive_failures = 0
         self._current_day = date.today()
         self._next_send_at = plan.first_send
 
@@ -222,42 +256,18 @@ class MailScheduler(QObject):
         self._running = False
         self._timer.stop()
         self._next_send_at = None
-        self._shutdown_send_thread()
+        self._cancel_active_send()
         self.running_changed.emit(False)
         self.status_changed.emit("已停止")
         self.log_message.emit("调度已停止")
 
-    def _shutdown_send_thread(self, timeout_ms: int = 3000) -> None:
-        """在主线程中停止发送线程，避免退出时 QThread 仍在运行。"""
-        self._send_generation += 1
-        self._pending_result = None
-        thread = self._thread
+    def _cancel_active_send(self) -> None:
+        """使当前结果失效；守护线程将在 socket 超时后自行结束。"""
         worker = self._worker
-        self._thread = None
-        self._worker = None
-        self._sending = False
-
-        if thread is None:
+        if worker is None or worker.cancelled:
             return
-
-        if thread.isRunning():
-            # SMTP 阻塞在 socket 时 quit 无效；短等后强制结束
-            try:
-                thread.finished.disconnect(self._on_thread_finished)
-            except (RuntimeError, TypeError):
-                pass
-            thread.quit()
-            if not thread.wait(timeout_ms):
-                thread.terminate()
-                thread.wait(1000)
-
-        if worker is not None:
-            try:
-                worker.finished.disconnect(self._on_worker_finished)
-            except (RuntimeError, TypeError):
-                pass
-            worker.deleteLater()
-        thread.deleteLater()
+        self._send_generation += 1
+        worker.cancel()
 
     def _schedule_next_send(self, now: datetime) -> None:
         assert self._config is not None
@@ -284,6 +294,7 @@ class MailScheduler(QObject):
         assert self._config is not None
         self._current_day = now.date()
         self._sent_today = 0
+        self._consecutive_failures = 0
         plan = build_daily_plan(self._config.schedule, now)
         if plan.valid:
             self._next_send_at = plan.first_send
@@ -345,13 +356,15 @@ class MailScheduler(QObject):
             # 兜底：若 SMTP 异常导致长期无回调，避免界面永久停在「正在发送」
             if (
                 self._send_started_at is not None
-                and (now - self._send_started_at).total_seconds() > 90
+                and (now - self._send_started_at).total_seconds()
+                > SEND_WATCHDOG_SECONDS
             ):
                 self.log_message.emit(
                     f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
                     "发送超时未返回结果，请检查 SMTP 设置后重试"
                 )
-                self._shutdown_send_thread(timeout_ms=1000)
+                self._cancel_active_send()
+                self._send_started_at = None
                 if self._running:
                     self._schedule_next_send(now)
             return
@@ -363,14 +376,13 @@ class MailScheduler(QObject):
         daily_count = self._config.schedule.daily_count
 
         # 确保不会叠两个发送线程
-        if self._thread is not None and self._thread.isRunning():
+        if self._thread is not None and self._thread.is_alive():
             return
 
         self._sending = True
         self._send_started_at = now
         self._send_generation += 1
         generation = self._send_generation
-        self._pending_result = None
         self.log_message.emit(
             f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
             f"正在发送第 {self._sent_today + 1}/{daily_count} 封..."
@@ -381,53 +393,44 @@ class MailScheduler(QObject):
             self._config.mail,
             self._config.proxy,
             generation=generation,
+            publish=self._send_results.finished.emit,
         )
-        # 不设置 parent，避免窗口销毁时 QThread 仍在运行被连带析构
-        thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        # 必须 QueuedConnection：lambda/无 context 时默认可能在工作线程直连执行
-        worker.finished.connect(
-            self._on_worker_finished, Qt.ConnectionType.QueuedConnection
+        # SMTP 是阻塞 I/O；使用 Python 守护线程避免 QThread 强杀/析构造成 native crash。
+        thread = threading.Thread(
+            target=worker.run,
+            name=f"AutoMailSMTP-{generation}",
+            daemon=True,
         )
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(self._on_thread_finished)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         self._worker = worker
         self._thread = thread
         thread.start()
 
-    def _on_worker_finished(self, success: bool, error: str) -> None:
-        """在主线程接收发送结果；不在此 wait 线程。"""
+    def _on_worker_finished(
+        self,
+        generation: int,
+        success: bool,
+        error: str,
+        cancelled: bool,
+    ) -> None:
+        """在主线程接收普通后台线程的发送结果。"""
         worker = self._worker
-        if worker is None or worker.generation != self._send_generation:
+        if worker is None or worker.generation != generation:
             return
-        self._pending_result = (success, error)
-
-    def _on_thread_finished(self) -> None:
-        """线程真正退出后再写日志 / 调度下一封。"""
-        if self.sender() is not self._thread:
-            return
-
-        result = self._pending_result
-        generation_ok = (
-            self._worker is not None
-            and self._worker.generation == self._send_generation
-        )
-        self._pending_result = None
+        generation_ok = generation == self._send_generation
         self._thread = None
         self._worker = None
         self._sending = False
+        started_at = self._send_started_at
+        self._send_started_at = None
 
-        if not generation_ok or result is None or self._config is None:
+        if cancelled or not generation_ok or self._config is None:
             return
 
-        success, error = result
-        now = self._send_started_at or datetime.now()
+        now = started_at or datetime.now()
         daily_count = self._config.schedule.daily_count
 
         if success:
+            self._consecutive_failures = 0
             self._sent_today += 1
             msg = (
                 f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -436,9 +439,23 @@ class MailScheduler(QObject):
             self.log_message.emit(msg)
             self.send_finished.emit(True, msg)
         else:
+            self._consecutive_failures += 1
             msg = f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 发送失败：{error}"
             self.log_message.emit(msg)
             self.send_finished.emit(False, msg)
+
+            if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                self._running = False
+                self._timer.stop()
+                self._next_send_at = None
+                pause_msg = (
+                    f"连续发送失败 {self._consecutive_failures} 次，自动发送已暂停；"
+                    "请检查 SMTP/代理后重新启动"
+                )
+                self.running_changed.emit(False)
+                self.status_changed.emit("连续失败，已暂停")
+                self.log_message.emit(pause_msg)
+                return
 
         if not self._running:
             return

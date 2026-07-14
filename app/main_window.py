@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -26,6 +27,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppConfig, load_config, save_config
+from app.gmail_api import (
+    authorize_gmail,
+    credentials_imported,
+    import_credentials,
+    is_gmail_account,
+    token_authorized,
+)
 from app.scheduler import MailScheduler, build_daily_plan, calc_interval_minutes
 
 
@@ -112,6 +120,7 @@ class MainWindow(QMainWindow):
         self._auto_calc_interval()
         self._connect_signals()
         self._refresh_plan_preview()
+        self._refresh_gmail_status()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -132,7 +141,8 @@ class MainWindow(QMainWindow):
         smtp_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.smtp_host = QLineEdit()
-        self.smtp_host.setPlaceholderText("例如 smtp.qq.com")
+        self.smtp_host.setPlaceholderText("例如 smtp.qq.com / smtp.gmail.com")
+        self.smtp_host.textChanged.connect(self._refresh_gmail_status)
         smtp_form.addRow("服务器", self.smtp_host)
 
         port_row = QHBoxLayout()
@@ -148,6 +158,7 @@ class MainWindow(QMainWindow):
 
         self.smtp_user = QLineEdit()
         self.smtp_user.setPlaceholderText("登录用户名 / 邮箱")
+        self.smtp_user.textChanged.connect(self._refresh_gmail_status)
         smtp_form.addRow("用户名", self.smtp_user)
 
         self.smtp_pass = QLineEdit()
@@ -156,13 +167,41 @@ class MainWindow(QMainWindow):
 
         self.smtp_sender = QLineEdit()
         self.smtp_sender.setPlaceholderText("留空则使用用户名")
+        self.smtp_sender.textChanged.connect(self._refresh_gmail_status)
         smtp_form.addRow("发件人", self.smtp_sender)
 
-        smtp_hint = QLabel("提示：需使用授权码而非登录密码。")
+        smtp_hint = QLabel("提示：非 Gmail 需使用授权码；Gmail 请导入凭证并用 API 发送。")
         smtp_hint.setWordWrap(True)
         smtp_hint.setStyleSheet("color: #666; font-size: 12px;")
         smtp_form.addRow(smtp_hint)
         settings_col.addWidget(smtp_box)
+
+        gmail_box = QGroupBox("Gmail API")
+        gmail_form = QFormLayout(gmail_box)
+
+        self.gmail_status_label = QLabel()
+        self.gmail_status_label.setWordWrap(True)
+        self.gmail_status_label.setStyleSheet("font-size: 12px;")
+        gmail_form.addRow("状态", self.gmail_status_label)
+
+        gmail_btn_row = QHBoxLayout()
+        self.gmail_import_btn = QPushButton("导入凭证")
+        self.gmail_import_btn.setToolTip("选择 Google Cloud 下载的 credentials.json")
+        self.gmail_import_btn.clicked.connect(self._on_import_gmail_credentials)
+        self.gmail_auth_btn = QPushButton("授权 Gmail")
+        self.gmail_auth_btn.setToolTip("打开浏览器完成 OAuth 授权")
+        self.gmail_auth_btn.clicked.connect(self._on_authorize_gmail)
+        gmail_btn_row.addWidget(self.gmail_import_btn)
+        gmail_btn_row.addWidget(self.gmail_auth_btn)
+        gmail_form.addRow(gmail_btn_row)
+
+        gmail_hint = QLabel(
+            "仅当用户名/发件人为 @gmail.com，或 SMTP 为 smtp.gmail.com 时走 Gmail API。"
+        )
+        gmail_hint.setWordWrap(True)
+        gmail_hint.setStyleSheet("color: #666; font-size: 12px;")
+        gmail_form.addRow(gmail_hint)
+        settings_col.addWidget(gmail_box)
 
         proxy_box = QGroupBox("本地代理")
         proxy_form = QFormLayout(proxy_box)
@@ -198,8 +237,8 @@ class MainWindow(QMainWindow):
         proxy_form.addRow("密码", self.proxy_pass)
 
         proxy_hint = QLabel(
-            "建议 SOCKS5（Clash 7890）。Gmail 经代理请用 587 且不要勾选 SSL；"
-            "勾选 465+SSL 失败时会自动回退 587。"
+            "建议 SOCKS5（Clash 7890）。Gmail API 与 SMTP 均可走代理；"
+            "SMTP 勾选 465+SSL 失败时会自动回退 587。"
         )
         proxy_hint.setWordWrap(True)
         proxy_hint.setStyleSheet("color: #666; font-size: 12px;")
@@ -490,6 +529,58 @@ class MainWindow(QMainWindow):
                 "font-size: 12px; color: #e65100; }"
             )
 
+    def _refresh_gmail_status(self) -> None:
+        cfg = self._collect_config()
+        if not is_gmail_account(cfg.smtp):
+            self.gmail_status_label.setText("当前非 Gmail，将使用 SMTP")
+            self.gmail_status_label.setStyleSheet("color: #666; font-size: 12px;")
+            self.gmail_auth_btn.setEnabled(False)
+            return
+
+        self.gmail_auth_btn.setEnabled(True)
+        if not credentials_imported():
+            self.gmail_status_label.setText("⚠️ 未导入 credentials.json")
+            self.gmail_status_label.setStyleSheet("color: #e65100; font-size: 12px;")
+        elif token_authorized():
+            self.gmail_status_label.setText("✅ 已授权，将使用 Gmail API 发送")
+            self.gmail_status_label.setStyleSheet("color: #2e7d32; font-size: 12px;")
+        else:
+            self.gmail_status_label.setText("⚠️ 已导入凭证，请点击「授权 Gmail」")
+            self.gmail_status_label.setStyleSheet("color: #e65100; font-size: 12px;")
+
+    def _on_import_gmail_credentials(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 credentials.json",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            import_credentials(path)
+            self.save_status_label.setText("✅ 凭证已导入")
+            QTimer.singleShot(3000, self.save_status_label.clear)
+            self._refresh_gmail_status()
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+
+    def _on_authorize_gmail(self) -> None:
+        cfg = self._collect_config()
+        if not credentials_imported():
+            QMessageBox.warning(self, "提示", "请先导入 credentials.json")
+            return
+        try:
+            self.gmail_status_label.setText("正在打开浏览器授权…")
+            QApplication.processEvents()
+            authorize_gmail(cfg.proxy)
+            self._refresh_gmail_status()
+            self.save_status_label.setText("✅ Gmail 授权成功")
+            QTimer.singleShot(3000, self.save_status_label.clear)
+        except Exception as exc:
+            self._refresh_gmail_status()
+            QMessageBox.critical(self, "授权失败", str(exc))
+
     def _on_proxy_toggled(self, enabled: bool) -> None:
         for widget in (
             self.proxy_type,
@@ -525,7 +616,22 @@ class MainWindow(QMainWindow):
             return
 
         cfg = self._collect_config()
-        if not cfg.smtp.host:
+        if is_gmail_account(cfg.smtp):
+            if not credentials_imported():
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "检测到 Gmail 账号，请先导入 credentials.json 并完成授权。",
+                )
+                return
+            if not token_authorized():
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "Gmail 尚未授权，请先点击「授权 Gmail」。",
+                )
+                return
+        elif not cfg.smtp.host:
             QMessageBox.warning(self, "提示", "请填写 SMTP 服务器")
             return
         if cfg.proxy.enabled and not cfg.proxy.host:

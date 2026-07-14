@@ -288,6 +288,17 @@ def send_email(
     mail_cfg: MailConfig,
     proxy_cfg: Optional[ProxyConfig] = None,
 ) -> None:
+    from app.gmail_api import is_gmail_account, send_via_gmail_api
+
+    # Gmail 账号走 OAuth API；其它邮箱继续 SMTP
+    if is_gmail_account(smtp_cfg):
+        try:
+            send_via_gmail_api(smtp_cfg, mail_cfg, proxy_cfg)
+            return
+        except Exception as exc:
+            _log_exception("Gmail API 发送失败", exc)
+            raise
+
     recipients = _parse_addresses(mail_cfg.recipients)
     if not recipients:
         raise ValueError("请填写至少一个收件人")

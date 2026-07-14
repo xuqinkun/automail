@@ -24,7 +24,7 @@ def _from_mapping(cls: Type[T], data: Any) -> T:
 class SmtpConfig:
     host: str = ""
     port: int = 465
-    use_ssl: bool = True
+    use_ssl: bool = False
     username: str = ""
     password: str = ""
     sender: str = ""

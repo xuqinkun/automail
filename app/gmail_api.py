@@ -38,6 +38,23 @@ def token_authorized() -> bool:
     return GMAIL_TOKEN_FILE.is_file()
 
 
+def resolve_sender(smtp_cfg: SmtpConfig) -> str:
+    return smtp_cfg.sender.strip() or smtp_cfg.username.strip()
+
+
+def validate_gmail_ready(smtp_cfg: SmtpConfig) -> str | None:
+    """启动发送前校验；返回错误文案，通过则返回 None。"""
+    if not is_gmail_account(smtp_cfg):
+        return None
+    if not resolve_sender(smtp_cfg):
+        return "请填写发件人邮箱或用户名（Gmail 地址）"
+    if not credentials_imported():
+        return "检测到 Gmail 账号，请先导入 credentials.json 并完成授权。"
+    if not token_authorized():
+        return "Gmail 尚未授权，请先点击「授权 Gmail」。"
+    return None
+
+
 def import_credentials(source_path: str | Path) -> Path:
     """将用户选择的 credentials.json 复制到 ~/.automail/。"""
     src = Path(source_path)
@@ -163,9 +180,9 @@ def _build_raw_message(smtp_cfg: SmtpConfig, mail_cfg: MailConfig) -> str:
         for addr in mail_cfg.cc.replace(";", ",").split(",")
         if addr.strip()
     ]
-    sender = smtp_cfg.sender.strip() or smtp_cfg.username.strip()
+    sender = resolve_sender(smtp_cfg)
     if not sender:
-        raise ValueError("请填写发件人邮箱（Gmail 地址）")
+        raise ValueError("请填写发件人邮箱或用户名（Gmail 地址）")
 
     msg = MIMEMultipart("alternative")
     msg["From"] = sender
@@ -187,6 +204,10 @@ def send_via_gmail_api(
     proxy_cfg: Optional[ProxyConfig] = None,
 ) -> None:
     """通过 Gmail API users.messages.send 发送邮件。"""
+    error = validate_gmail_ready(smtp_cfg)
+    if error:
+        raise ValueError(error)
+
     try:
         from googleapiclient.discovery import build
         from googleapiclient.errors import HttpError

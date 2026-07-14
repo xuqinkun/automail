@@ -32,7 +32,9 @@ from app.gmail_api import (
     credentials_imported,
     import_credentials,
     is_gmail_account,
+    resolve_sender,
     token_authorized,
+    validate_gmail_ready,
 )
 from app.scheduler import MailScheduler, build_daily_plan, calc_interval_minutes
 
@@ -114,13 +116,23 @@ class MainWindow(QMainWindow):
 
         self._config = load_config()
         self._scheduler = MailScheduler(self)
+        self._form_locked = False
+        self._loading_form = False
+        self._autosave_ready = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(800)
+        self._autosave_timer.timeout.connect(self._autosave_config)
 
         self._build_ui()
         self._load_to_form()
         self._auto_calc_interval()
         self._connect_signals()
+        self._connect_autosave()
         self._refresh_plan_preview()
         self._refresh_gmail_status()
+        # 延迟开启自动保存，避免启动加载过程中误把空表单写回磁盘
+        QTimer.singleShot(1500, self._enable_autosave)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -150,7 +162,7 @@ class MainWindow(QMainWindow):
         self.smtp_port.setRange(1, 65535)
         self.smtp_port.setValue(465)
         self.smtp_ssl = QCheckBox("SSL")
-        self.smtp_ssl.setChecked(True)
+        self.smtp_ssl.setChecked(False)
         port_row.addWidget(self.smtp_port)
         port_row.addWidget(self.smtp_ssl)
         port_row.addStretch()
@@ -398,36 +410,124 @@ class MainWindow(QMainWindow):
         self._scheduler.log_message.connect(self._append_log)
         self._scheduler.running_changed.connect(self._on_running_changed)
 
+    def _connect_autosave(self) -> None:
+        """表单变动后自动写入 ~/.automail/config.json，下次启动可恢复。"""
+        text_widgets = (
+            self.smtp_host,
+            self.smtp_user,
+            self.smtp_pass,
+            self.smtp_sender,
+            self.proxy_host,
+            self.proxy_user,
+            self.proxy_pass,
+            self.mail_to,
+            self.mail_cc,
+            self.mail_subject,
+            self.schedule_deadline,
+            self.schedule_start,
+        )
+        for widget in text_widgets:
+            widget.textChanged.connect(self._schedule_autosave)
+
+        self.mail_body.textChanged.connect(self._schedule_autosave)
+
+        for widget in (
+            self.smtp_port,
+            self.proxy_port,
+            self.schedule_count,
+            self.schedule_interval,
+        ):
+            widget.valueChanged.connect(self._schedule_autosave)
+
+        for widget in (self.smtp_ssl, self.proxy_enabled, self.mail_html):
+            widget.toggled.connect(self._schedule_autosave)
+
+        self.proxy_type.currentIndexChanged.connect(self._schedule_autosave)
+
+    def _schedule_autosave(self, *_args) -> None:
+        if not self._autosave_ready or self._loading_form or self._form_locked:
+            return
+        self._autosave_timer.start()
+
+    def _enable_autosave(self) -> None:
+        self._autosave_ready = True
+
+    def _autosave_config(self) -> None:
+        if not self._autosave_ready or self._loading_form or self._form_locked:
+            return
+        try:
+            save_config(self._collect_config())
+            self.save_status_label.setStyleSheet("color: #2e7d32; font-size: 12px;")
+            self.save_status_label.setText("已自动保存")
+            QTimer.singleShot(2000, self.save_status_label.clear)
+        except OSError:
+            self.save_status_label.setStyleSheet("color: #e65100; font-size: 12px;")
+            self.save_status_label.setText("自动保存失败")
+            QTimer.singleShot(3000, self._reset_save_status)
+
+    def _reset_save_status(self) -> None:
+        self.save_status_label.clear()
+        self.save_status_label.setStyleSheet("color: #2e7d32; font-size: 12px;")
+
     def _load_to_form(self) -> None:
-        c = self._config
-        self.smtp_host.setText(c.smtp.host)
-        self.smtp_port.setValue(c.smtp.port)
-        self.smtp_ssl.setChecked(c.smtp.use_ssl)
-        self.smtp_user.setText(c.smtp.username)
-        self.smtp_pass.setText(c.smtp.password)
-        self.smtp_sender.setText(c.smtp.sender)
+        self._loading_form = True
+        widgets = (
+            self.smtp_host,
+            self.smtp_port,
+            self.smtp_ssl,
+            self.smtp_user,
+            self.smtp_pass,
+            self.smtp_sender,
+            self.proxy_enabled,
+            self.proxy_type,
+            self.proxy_host,
+            self.proxy_port,
+            self.proxy_user,
+            self.proxy_pass,
+            self.mail_to,
+            self.mail_cc,
+            self.mail_subject,
+            self.mail_html,
+            self.mail_body,
+            self.schedule_count,
+            self.schedule_interval,
+            self.schedule_deadline,
+            self.schedule_start,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            c = self._config
+            self.smtp_host.setText(c.smtp.host)
+            self.smtp_port.setValue(c.smtp.port)
+            self.smtp_ssl.setChecked(c.smtp.use_ssl)
+            self.smtp_user.setText(c.smtp.username)
+            self.smtp_pass.setText(c.smtp.password)
+            self.smtp_sender.setText(c.smtp.sender)
 
-        self.proxy_enabled.setChecked(c.proxy.enabled)
-        idx = self.proxy_type.findData(c.proxy.proxy_type)
-        self.proxy_type.setCurrentIndex(idx if idx >= 0 else 0)
-        self.proxy_host.setText(c.proxy.host or "127.0.0.1")
-        self.proxy_port.setValue(c.proxy.port or 7890)
-        self.proxy_user.setText(c.proxy.username)
-        self.proxy_pass.setText(c.proxy.password)
-        self._on_proxy_toggled(c.proxy.enabled)
+            self.proxy_enabled.setChecked(c.proxy.enabled)
+            idx = self.proxy_type.findData(c.proxy.proxy_type)
+            self.proxy_type.setCurrentIndex(idx if idx >= 0 else 0)
+            self.proxy_host.setText(c.proxy.host or "127.0.0.1")
+            self.proxy_port.setValue(c.proxy.port or 7890)
+            self.proxy_user.setText(c.proxy.username)
+            self.proxy_pass.setText(c.proxy.password)
 
-        self.mail_to.setText(c.mail.recipients)
-        self.mail_cc.setText(c.mail.cc)
-        self.mail_subject.setText(c.mail.subject)
-        self.mail_body.setPlainText(c.mail.body)
-        self.mail_html.setChecked(c.mail.is_html)
+            self.mail_to.setText(c.mail.recipients)
+            self.mail_cc.setText(c.mail.cc)
+            self.mail_subject.setText(c.mail.subject)
+            self.mail_body.setPlainText(c.mail.body)
+            self.mail_html.setChecked(c.mail.is_html)
 
-        self.schedule_count.setValue(c.schedule.daily_count)
-        self.schedule_interval.blockSignals(True)
-        self.schedule_interval.setValue(c.schedule.interval_minutes)
-        self.schedule_interval.blockSignals(False)
-        self.schedule_deadline.setText(c.schedule.deadline_time or "23:59")
-        self._set_start_display(c.schedule.start_time)
+            self.schedule_count.setValue(c.schedule.daily_count)
+            self.schedule_interval.setValue(c.schedule.interval_minutes)
+            self.schedule_deadline.setText(c.schedule.deadline_time or "23:59")
+            self._set_start_display(c.schedule.start_time)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            self._on_proxy_toggled(self.proxy_enabled.isChecked())
+            self._loading_form = False
 
     def _set_start_display(self, start_time: str) -> None:
         text = start_time.strip()
@@ -491,6 +591,8 @@ class MainWindow(QMainWindow):
         self._refresh_plan_preview()
 
     def _on_pick_deadline(self) -> None:
+        if getattr(self, "_form_locked", False):
+            return
         dlg = TimePickDialog(
             self,
             "选择最晚发送时刻",
@@ -500,8 +602,11 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.schedule_deadline.setText(dlg.selected_time() or "23:59")
             self._on_schedule_changed()
+            self._schedule_autosave()
 
     def _on_pick_start(self) -> None:
+        if getattr(self, "_form_locked", False):
+            return
         dlg = TimePickDialog(
             self,
             "选择开始发送时刻",
@@ -512,6 +617,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._set_start_display(dlg.selected_time())
             self._on_schedule_changed()
+            self._schedule_autosave()
 
     def _refresh_plan_preview(self) -> None:
         cfg = self._collect_config()
@@ -530,6 +636,8 @@ class MainWindow(QMainWindow):
             )
 
     def _refresh_gmail_status(self) -> None:
+        if self._loading_form or getattr(self, "_form_locked", False):
+            return
         cfg = self._collect_config()
         if not is_gmail_account(cfg.smtp):
             self.gmail_status_label.setText("当前非 Gmail，将使用 SMTP")
@@ -538,7 +646,10 @@ class MainWindow(QMainWindow):
             return
 
         self.gmail_auth_btn.setEnabled(True)
-        if not credentials_imported():
+        if not resolve_sender(cfg.smtp):
+            self.gmail_status_label.setText("⚠️ 请填写用户名或发件人（Gmail 地址）")
+            self.gmail_status_label.setStyleSheet("color: #e65100; font-size: 12px;")
+        elif not credentials_imported():
             self.gmail_status_label.setText("⚠️ 未导入 credentials.json")
             self.gmail_status_label.setStyleSheet("color: #e65100; font-size: 12px;")
         elif token_authorized():
@@ -582,6 +693,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "授权失败", str(exc))
 
     def _on_proxy_toggled(self, enabled: bool) -> None:
+        if getattr(self, "_form_locked", False):
+            return
         for widget in (
             self.proxy_type,
             self.proxy_host,
@@ -590,6 +703,47 @@ class MainWindow(QMainWindow):
             self.proxy_pass,
         ):
             widget.setEnabled(enabled)
+
+    def _set_form_locked(self, locked: bool) -> None:
+        """自动发送运行期间锁定配置与邮件内容，仅保留停止按钮与日志。"""
+        self._form_locked = locked
+        editable = not locked
+
+        for widget in (
+            self.smtp_host,
+            self.smtp_port,
+            self.smtp_ssl,
+            self.smtp_user,
+            self.smtp_pass,
+            self.smtp_sender,
+            self.gmail_import_btn,
+            self.gmail_auth_btn,
+            self.proxy_enabled,
+            self.save_btn,
+            self.mail_to,
+            self.mail_cc,
+            self.mail_subject,
+            self.mail_html,
+            self.mail_body,
+            self.schedule_count,
+            self.schedule_interval,
+            self.schedule_deadline,
+            self.schedule_start,
+        ):
+            widget.setEnabled(editable)
+
+        if editable:
+            self._on_proxy_toggled(self.proxy_enabled.isChecked())
+            self._refresh_gmail_status()
+        else:
+            for widget in (
+                self.proxy_type,
+                self.proxy_host,
+                self.proxy_port,
+                self.proxy_user,
+                self.proxy_pass,
+            ):
+                widget.setEnabled(False)
 
     def _on_save(self) -> None:
         cfg = self._collect_config()
@@ -604,11 +758,10 @@ class MainWindow(QMainWindow):
         if running:
             self.send_btn.setText("停止自动发送")
             self.send_btn.setStyleSheet(self._stop_btn_style())
-            self.save_btn.setEnabled(False)
         else:
             self.send_btn.setText("开始自动发送")
             self.send_btn.setStyleSheet(self._start_btn_style())
-            self.save_btn.setEnabled(True)
+        self._set_form_locked(running)
 
     def _on_toggle_schedule(self) -> None:
         if self._scheduler.is_running:
@@ -617,22 +770,15 @@ class MainWindow(QMainWindow):
 
         cfg = self._collect_config()
         if is_gmail_account(cfg.smtp):
-            if not credentials_imported():
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    "检测到 Gmail 账号，请先导入 credentials.json 并完成授权。",
-                )
-                return
-            if not token_authorized():
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    "Gmail 尚未授权，请先点击「授权 Gmail」。",
-                )
+            gmail_error = validate_gmail_ready(cfg.smtp)
+            if gmail_error:
+                QMessageBox.warning(self, "提示", gmail_error)
                 return
         elif not cfg.smtp.host:
             QMessageBox.warning(self, "提示", "请填写 SMTP 服务器")
+            return
+        elif not resolve_sender(cfg.smtp):
+            QMessageBox.warning(self, "提示", "请填写发件人邮箱或用户名")
             return
         if cfg.proxy.enabled and not cfg.proxy.host:
             QMessageBox.warning(self, "提示", "已启用代理，请填写代理地址")
@@ -664,7 +810,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._scheduler.stop()
-        save_config(self._collect_config())
+        self._autosave_timer.stop()
+        try:
+            save_config(self._collect_config())
+        except OSError:
+            pass
         event.accept()
 
 
